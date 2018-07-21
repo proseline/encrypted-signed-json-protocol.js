@@ -1,3 +1,3 @@
-# encrypted-json-protocol
+# encrypted-signed-json-protocol
 
-Create Node.js streams for encrypted, JSON-message protocols.
+Create Node.js streams for encrypted, signed, JSON-message protocols.
