@@ -4,10 +4,16 @@ var assert = require("assert");
 var inherits = require("inherits");
 var lengthPrefixedStream = require("length-prefixed-stream");
 var sodium = require("sodium-universal");
+var stringify = require("fast-json-stable-stringify");
 var through2 = require("through2");
 
 var STREAM_NONCEBYTES = sodium.crypto_stream_NONCEBYTES;
 var STREAM_KEYBYTES = sodium.crypto_stream_KEYBYTES;
+
+var SIGN_BYTES = sodium.crypto_sign_BYTES;
+var SEEDBYTES = sodium.crypto_sign_SEEDBYTES;
+var PUBLICKEYBYTES = sodium.crypto_sign_PUBLICKEYBYTES;
+var SECRETKEYBYTES = sodium.crypto_sign_SECRETKEYBYTES;
 
 var HANDSHAKE_PREFIX = 0;
 
@@ -67,6 +73,11 @@ module.exports = function(options) {
         enum: messageTypePrefixes
       },
       {
+        title: "Signature",
+        type: "string",
+        pattern: "^[a-f0-9]{128}$"
+      },
+      {
         title: "Message Payload"
         /* anything */
       }
@@ -106,6 +117,39 @@ module.exports = function(options) {
       STREAM_KEYBYTES,
       "replicationKey must be crypto_stream_KEYBYTES long"
     );
+
+    if (
+      options.hasOwnProperty("publicKey") &&
+      options.hasOwnProperty("secretKey")
+    ) {
+      assert(Buffer.isBuffer(options.publicKey), "publicKey must be Buffer");
+      assert.equal(
+        options.publicKey.byteLength,
+        PUBLICKEYBYTES,
+        "seed must be crypto_sign_PUBLICKEYBYTES long"
+      );
+      assert(Buffer.isBuffer(options.secretKey), "secretKey must be Buffer");
+      assert.equal(
+        options.secretKey.byteLength,
+        SECRETKEYBYTES,
+        "seed must be crypto_sign_SECRETKEYBYTES long"
+      );
+      this._publicKey = options.publicKey;
+      this._secretKey = options.secretKey;
+    } else if (options.hasOwnProperty("seed")) {
+      assert(Buffer.isBuffer(options.seed), "seed must be Buffer");
+      assert.equal(
+        options.seed.byteLength,
+        SEEDBYTES,
+        "seed must be crypto_sign_SEEDBYTES long"
+      );
+      var seed = options.seed;
+      this._publicKey = Buffer.alloc(PUBLICKEYBYTES);
+      this._secretKey = Buffer.alloc(SECRETKEYBYTES);
+      sodium.crypto_sign_seed_keypair(this._publicKey, this._secretKey, seed);
+    } else {
+      assert.fail("must provide secretKey and publicKey or seed");
+    }
 
     this._initializeReadable();
     this._initializeWritable();
@@ -229,10 +273,25 @@ module.exports = function(options) {
     });
   };
 
-  Protocol.prototype._encode = function(prefix, body, callback) {
-    var tuple = [prefix, body];
-    var buffer = Buffer.from(JSON.stringify(tuple), "utf8");
-    this._encoderStream.write(buffer, callback);
+  Protocol.prototype._encode = function(prefix, data, callback) {
+    var tuple = [prefix];
+    var dataBuffer = Buffer.from(stringify(data), "utf8");
+    var signature = Buffer.alloc(SIGN_BYTES);
+    sodium.crypto_sign_detached(signature, dataBuffer, this._secretKey);
+    tuple.push(signature.toString("hex"));
+    tuple.push(data);
+    this._encoderStream.write(
+      Buffer.from(JSON.stringify(tuple), "utf8"),
+      callback
+    );
+  };
+
+  Protocol.prototype._validSignature = function(signature, data) {
+    return sodium.crypto_sign_verify_detached(
+      Buffer.from(signature, "hex"),
+      Buffer.from(stringify(data)),
+      Buffer.from(this._publicKey, "hex")
+    );
   };
 
   Protocol.prototype._parse = function(message, callback) {
@@ -245,7 +304,8 @@ module.exports = function(options) {
       return callback(new Error("invalid tuple"));
     }
     var prefix = parsed[0];
-    var body = parsed[1];
+    var signature = parsed[1];
+    var body = parsed[2];
     if (prefix === 0 && validHandshake(body)) {
       if (version !== body.version) {
         var error = new Error("version mismatch");
@@ -264,6 +324,9 @@ module.exports = function(options) {
       }
       this.emit("handshake");
       return callback();
+    }
+    if (!this._validSignature(signature, body)) {
+      return callback(new Error("invalid signature"));
     }
     var type = messageTypesByPrefix[prefix];
     if (!type || !type.valid(body) || !type.verify(body)) {
